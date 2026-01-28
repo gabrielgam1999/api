@@ -1,6 +1,6 @@
 import express from 'express';
 import cors from 'cors';
-import * as cheerio from 'cheerio';
+import puppeteer from 'puppeteer';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,85 +20,100 @@ function makeSlug(title) {
         .replace(/-+/g, '-');
 }
 
-// Scraper for Cuevana
-async function scrapeCuevana(type, title, season, episode) {
+// Scraper with Puppeteer
+async function scrapeWithPuppeteer(url, siteName) {
+    let browser;
     try {
-        const slug = makeSlug(title);
-        const url = type === 'movie' 
-            ? `https://cuevana.bi/pelicula/${slug}`
-            : `https://cuevana.bi/serie/${slug}/temporada-${season}/episodio-${episode}`;
-        
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        
-        const html = await res.text();
-        const $ = cheerio.load(html);
-        
-        const iframes = [];
-        $('iframe').each((i, el) => {
-            const src = $(el).attr('src');
-            if (src && src.includes('http')) iframes.push(src);
+        browser = await puppeteer.launch({
+            headless: 'new',
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu'
+            ]
         });
         
-        return iframes.length > 0 ? iframes[0] : null;
+        const page = await browser.newPage();
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
+        
+        // Navigate and wait for network to be idle
+        await page.goto(url, { 
+            waitUntil: 'networkidle2',
+            timeout: 30000 
+        });
+        
+        // Wait a bit more for dynamic content
+        await page.waitForTimeout(3000);
+        
+        // Try multiple selectors
+        const iframeSrc = await page.evaluate(() => {
+            // Try different iframe selectors
+            const selectors = [
+                'iframe[src*="http"]',
+                'iframe#playerframe',
+                'iframe.player',
+                '#player iframe',
+                '.player-container iframe',
+                'iframe'
+            ];
+            
+            for (const selector of selectors) {
+                const iframe = document.querySelector(selector);
+                if (iframe && iframe.src && iframe.src.startsWith('http')) {
+                    return iframe.src;
+                }
+            }
+            
+            // If no iframe found, try to find in all iframes
+            const allIframes = document.querySelectorAll('iframe');
+            for (const iframe of allIframes) {
+                if (iframe.src && iframe.src.startsWith('http')) {
+                    return iframe.src;
+                }
+            }
+            
+            return null;
+        });
+        
+        await browser.close();
+        return iframeSrc;
+        
     } catch (e) {
-        console.error('Cuevana error:', e);
+        console.error(`${siteName} error:`, e.message);
+        if (browser) await browser.close();
         return null;
     }
+}
+
+// Scraper for Cuevana
+async function scrapeCuevana(type, title, season, episode) {
+    const slug = makeSlug(title);
+    const url = type === 'movie' 
+        ? `https://cuevana.bi/pelicula/${slug}`
+        : `https://cuevana.bi/serie/${slug}/temporada-${season}/episodio-${episode}`;
+    
+    return await scrapeWithPuppeteer(url, 'Cuevana');
 }
 
 // Scraper for PelisPlus
 async function scrapePelisPlus(type, title, season, episode) {
-    try {
-        const slug = makeSlug(title);
-        const url = type === 'movie'
-            ? `https://pelisplus.lat/pelicula/${slug}`
-            : `https://pelisplus.lat/serie/${slug}/temporada-${season}/episodio-${episode}`;
-        
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        
-        const html = await res.text();
-        const $ = cheerio.load(html);
-        
-        const iframes = [];
-        $('iframe').each((i, el) => {
-            const src = $(el).attr('src');
-            if (src && src.includes('http')) iframes.push(src);
-        });
-        
-        return iframes.length > 0 ? iframes[0] : null;
-    } catch (e) {
-        console.error('PelisPlus error:', e);
-        return null;
-    }
+    const slug = makeSlug(title);
+    const url = type === 'movie'
+        ? `https://pelisplus.lat/pelicula/${slug}`
+        : `https://pelisplus.lat/serie/${slug}/temporada-${season}/episodio-${episode}`;
+    
+    return await scrapeWithPuppeteer(url, 'PelisPlus');
 }
 
 // Scraper for RePelis
 async function scrapeRepelis(type, title, season, episode) {
-    try {
-        const slug = makeSlug(title);
-        const url = type === 'movie'
-            ? `https://repelishd.city/pelicula/${slug}`
-            : `https://repelishd.city/serie/${slug}-temporada-${season}-episodio-${episode}`;
-        
-        const res = await fetch(url);
-        if (!res.ok) return null;
-        
-        const html = await res.text();
-        const $ = cheerio.load(html);
-        
-        const iframes = [];
-        $('iframe').each((i, el) => {
-            const src = $(el).attr('src');
-            if (src && src.includes('http')) iframes.push(src);
-        });
-        
-        return iframes.length > 0 ? iframes[0] : null;
-    } catch (e) {
-        console.error('RePelis error:', e);
-        return null;
-    }
+    const slug = makeSlug(title);
+    const url = type === 'movie'
+        ? `https://repelishd.city/pelicula/${slug}`
+        : `https://repelishd.city/serie/${slug}-temporada-${season}-episodio-${episode}`;
+    
+    return await scrapeWithPuppeteer(url, 'RePelis');
 }
 
 // API Route
@@ -110,28 +125,49 @@ app.get('/api/sources', async (req, res) => {
     }
     
     try {
-        const [cuevana, pelisplus, repelis] = await Promise.all([
-            scrapeCuevana(type, title, season, episode),
-            scrapePelisPlus(type, title, season, episode),
-            scrapeRepelis(type, title, season, episode)
-        ]);
+        console.log(`Scraping: ${title} (${type})`);
         
+        // Try sites one by one (not parallel to save resources)
         const sources = [];
         
-        if (cuevana) sources.push({ name: 'Cuevana', url: cuevana, lang: 'LAT' });
-        if (pelisplus) sources.push({ name: 'PelisPlus', url: pelisplus, lang: 'LAT' });
-        if (repelis) sources.push({ name: 'RePelis', url: repelis, lang: 'LAT' });
+        const cuevana = await scrapeCuevana(type, title, season, episode);
+        if (cuevana) {
+            sources.push({ name: 'Cuevana', url: cuevana, lang: 'LAT' });
+        }
         
+        // Only try next if first failed
+        if (sources.length === 0) {
+            const pelisplus = await scrapePelisPlus(type, title, season, episode);
+            if (pelisplus) {
+                sources.push({ name: 'PelisPlus', url: pelisplus, lang: 'LAT' });
+            }
+        }
+        
+        // Only try last if both failed
+        if (sources.length === 0) {
+            const repelis = await scrapeRepelis(type, title, season, episode);
+            if (repelis) {
+                sources.push({ name: 'RePelis', url: repelis, lang: 'LAT' });
+            }
+        }
+        
+        console.log(`Found ${sources.length} sources`);
         return res.json({ sources });
+        
     } catch (e) {
         console.error('API error:', e);
-        return res.status(500).json({ error: 'Scraping failed' });
+        return res.status(500).json({ error: 'Scraping failed', details: e.message });
     }
 });
 
 // Root route
 app.get('/', (req, res) => {
-    res.json({ message: 'Scraper API - Use /api/sources' });
+    res.json({ message: 'Scraper API with Puppeteer - Use /api/sources' });
+});
+
+// Health check
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok' });
 });
 
 app.listen(PORT, () => {
